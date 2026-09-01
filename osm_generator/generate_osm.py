@@ -76,11 +76,26 @@ LANE_HALF_M = 8.0            # physical: corridor either side of a lane centreli
 # edge back across the boundary it was just cut to - which is how fields end up
 # overlapping the woods they were supposed to stop at.
 FIELD_SIMPLIFY_M = 6.0
-WOOD_SIMPLIFY_M = 8.0
 SIMPLIFY_SLACK_M = 12.0
 MIN_FIELD_HA = 1.2 * K * K
 MIN_FIELD_WIDTH_M = 45.0 * K  # 2*area/perimeter; drops slivers pinched off by a lane
+
+# --- woodland ---------------------------------------------------------------------
+# A wood here is not a canopy: it is the block of ground the trees get planted on by
+# hand in the editor. So the polygon is regularised into a shape with a workable
+# interior rather than left following the tree line in the photograph - and because
+# these are shapes read off the image, the two radii scale with the map.
+WOOD_CLOSE_M = 45.0 * K       # notches narrower than this are filled in...
+WOOD_OPEN_M = 30.0 * K        # ...and limbs thinner than this are cut off
+WOOD_SPECK_HA = 0.075 * K * K  # leaf-coloured noise, dropped before any of that
 MIN_WOOD_HA = 0.8 * K * K
+WOOD_CLEAR_M = 8.0            # physical: how far a wood stands off water and yards
+WOOD_SIMPLIFY_M = 25.0        # physical: coarse on purpose - a dozen corners you can
+                              # follow in the editor, not a two-metre-accurate tree line
+WOOD_POCKET_M = MIN_FIELD_WIDTH_M / 2.0   # half-width of the scraps a wood takes back
+                                          # after the parcels are cut: anything this
+                                          # narrow is below MIN_FIELD_WIDTH_M and can
+                                          # never become a field, whatever is tried
 
 # --- lanes ------------------------------------------------------------------------
 # The crossing penalties are added to edge lengths, which scale with the map, so they
@@ -193,16 +208,27 @@ def main():
     pdraw = ImageDraw.Draw(pad_img)
     for pad in pads:
         pdraw.polygon([(x / s, y / s) for x, y in ms.grow_ring(pad["ring"],
-                       WOOD_SIMPLIFY_M)], fill=255, outline=255)
+                       WOOD_CLEAR_M)], fill=255, outline=255)
     keep_clear = ndimage.binary_dilation(water_mask | (np.array(pad_img) > 0),
-                                         ms.disk(WOOD_SIMPLIFY_M / s))
+                                         ms.disk(WOOD_CLEAR_M / s))
     wood_grid &= ~keep_clear
+
+    # Then the outline is regularised (see WOOD_CLOSE_M). Two things come out of it.
+    # The obvious one is a block you can plant: a dozen corners instead of a hundred,
+    # no pinched arms, no holes. The other is that the bare ground goes away - the
+    # pockets in a ragged canopy are too small and too awkward to survive as parcels,
+    # so what the photo drew as a lacy wood came out as a wood ringed by nothing at
+    # all. Filling the notches hands that ground to the wood, which is where the
+    # trees were in the photo anyway. The cut against water and yards is repeated
+    # afterwards, because the closing pass will happily reach back over both.
+    wood_grid = ms.regularise(wood_grid, WOOD_CLOSE_M, WOOD_OPEN_M,
+                              WOOD_SPECK_HA, s) & ~keep_clear
     woods = ms.trace_components(wood_grid, s, MIN_WOOD_HA, WOOD_SIMPLIFY_M)
-    woods.sort(key=lambda z: -z[1])
-    for i, (ring, ha) in enumerate(woods, 1):
-        add_way(ring, {'natural': 'wood', 'landuse': 'farmyard',
-                       'leaf_type': 'broadleaved', 'name': f'Wood {i} ({ha:.1f} ha)'})
-    print(f"   {len(woods)} woods, {sum(h for _, h in woods):.0f} ha")
+    # Traced now because the lanes route around them and the parcels are cut against
+    # them, but not written out yet: the final outline is only known once the fields
+    # have taken what they can (see 7b).
+    print(f"   {len(woods)} woods, {sum(h for _, h in woods):.0f} ha before the "
+          f"parcels are cut")
 
     # ------------------------------------------------------------------ 3. farmyards
     print("3. Village and industrial pads...")
@@ -291,6 +317,20 @@ def main():
     areas = np.array([h for _, h in fields])
     print(f"   {len(fields)} fields: {areas.min():.1f} / {np.median(areas):.1f} / "
           f"{areas.max():.1f} ha (min/median/max), {areas.sum():.0f} ha farmed")
+
+    # ------------------------------------------------------------------ 7b. woodland
+    print("7b. Handing the leftover ground back to the woods...")
+    before = sum(h for _, h in woods)
+    wood_grid = close_wood_gaps(wood_grid, fields, pads, ways, water_mask, n, s)
+    woods = ms.trace_components(wood_grid, s, MIN_WOOD_HA, WOOD_SIMPLIFY_M)
+    woods.sort(key=lambda z: -z[1])
+    for i, (ring, ha) in enumerate(woods, 1):
+        add_way(ring, {'natural': 'wood', 'landuse': 'farmyard',
+                       'leaf_type': 'broadleaved', 'name': f'Wood {i} ({ha:.1f} ha)'})
+    grown = sum(h for _, h in woods)
+    verts = [len(r) for r, _ in woods]
+    print(f"   {len(woods)} woods, {grown:.0f} ha (+{grown - before:.0f} ha of ground "
+          f"no parcel could use), {min(verts)}-{max(verts)} corners each")
 
     # ------------------------------------------------------------------ 8. junctions
     print("8. Splicing shared nodes at road crossings...")
@@ -1035,6 +1075,62 @@ def village_streets(village, gates, add_way, river_tree):
     for pts, tags in ways_out:
         emit(pts, tags)
     return len(ways_out)
+
+
+def close_wood_gaps(wood_grid, fields, pads, ways, water_mask, n, s):
+    """Give the woods every scrap of ground the parcels left stranded against them.
+
+    Cutting the fields leaves crescents. A Voronoi cell that loses most of itself to a
+    wood comes back below MIN_FIELD_HA or thinner than MIN_FIELD_WIDTH_M, gets dropped,
+    and what remains is bare ground in the shape of the wood it lies against. On the
+    render that is the black rim around every copse; in the editor it is a strip nobody
+    can plough, fence or build on. The wood takes it - which is what the photograph had
+    growing there before the parcels were laid over it.
+
+    Only the wide scraps: the mask is opened at WOOD_POCKET_M first, so the hedgerow
+    web between the fields stays a hedgerow web. Without that the whole gap network is
+    one connected component and a single wood would swallow the lot.
+
+    Roads count as occupied while the scraps are being found, so a lane cannot join two
+    pockets into one, but not when the result is cut back - a lane through a wood is
+    ordinary, and standing the trees off every verge would saw the block in half.
+    """
+    img = Image.new("L", (n, n), 0)
+    draw = ImageDraw.Draw(img)
+    for ring, _ in fields:
+        draw.polygon([(x / s, y / s) for x, y in ring], fill=255, outline=255)
+    for pad in pads:
+        draw.polygon([(x / s, y / s) for x, y in pad["ring"]], fill=255, outline=255)
+    held = (np.array(img) > 0) | water_mask
+
+    lanes = Image.new("L", (n, n), 0)
+    ldraw = ImageDraw.Draw(lanes)
+    for w in ways:
+        if 'highway' not in w['tags']:
+            continue
+        pts = [(x / s, y / s) for x, y in w['coords']]
+        if len(pts) >= 2:
+            ldraw.line(pts, fill=255, width=max(1, int(round(2 * LANE_HALF_M / s))),
+                       joint="curve")
+
+    free = ~(held | wood_grid | (np.array(lanes) > 0))
+    pocket = ms.regularise(free, 0.0, WOOD_POCKET_M, 0.0, s, fill=False)
+    if pocket.any():
+        # A pocket does not touch its wood: the parcels were cut back from the canopy,
+        # so a margin band lies between them - and that band is far too narrow to
+        # survive the opening above. Reach across it instead of demanding contact.
+        reach = WOOD_MARGIN_M + SIMPLIFY_SLACK_M
+        lab, k = ndimage.label(pocket, np.ones((3, 3), bool))
+        near = ndimage.binary_dilation(wood_grid, ms.disk(reach / s))
+        taken = np.zeros(k + 1, bool)
+        taken[1:] = ndimage.sum(near, lab, range(1, k + 1)) > 0
+        # ...and then close the same band, so the scrap and the wood come out as one
+        # polygon rather than two rings a few metres apart.
+        wood_grid = ms.regularise(wood_grid | taken[lab], reach, 0.0, 0.0, s)
+
+    # The outline tolerance is the slack: Douglas-Peucker at WOOD_SIMPLIFY_M can pull an
+    # edge that much off the mask, and it must not walk over a field boundary doing it.
+    return wood_grid & ~ndimage.binary_dilation(held, ms.disk(WOOD_SIMPLIFY_M / s))
 
 
 def build_blocked_mask(n, s, woods, pads, river, ways, lake_grid):

@@ -22,11 +22,11 @@ way down its course the river opens out into a lake and leaves it again at the f
 | Playable area | 8192 × 8192 m, centred (offset 2048 m) |
 | Heights | 16-bit **centimetres** (`raw / 100 = metres`) |
 | Relief | ~22 m at the river mouth to ~110 m on the hilltops |
-| Fields | ~178 parcels, 5–72 ha (median ~28 ha), ~5200 ha farmed |
-| Woodland | ~18 woods, ~360 ha |
+| Fields | ~175 parcels, 5–72 ha (median ~29 ha), ~5200 ha farmed |
+| Woodland | ~22 woods, ~610 ha (9%), 6–31 corners each |
 | Farmyards | 1 village (60 ha) + 11 flat industrial pads, ~310 ha |
 | Water | River (~35 ha) plus a 91 ha lake on it, 6 m deep, mean 4.7 m |
-| Roads | ~79 km, primary / secondary / tertiary, 3 bridges |
+| Roads | ~76 km, primary / secondary / tertiary, 4 bridges |
 | Farmland slope | median 1.4°, p99 6.3°, max 16.4° |
 
 Field sizes follow from the two constraints together: the reference image is mapped 1:1
@@ -39,6 +39,25 @@ stays on the water however the traced alignment moves. Across its reach the wate
 is held flat — that is what makes it a lake and not a wide bit of river — and the profile
 drops again at the outlet. Nothing crosses it: lanes are routed round, and the river is
 bridged only above and below it.
+
+A wood is **not a canopy** — it is the block of ground the trees get planted on by hand
+in the editor — so the outline traced off the photograph is regularised before it is
+written out. Notches narrower than `WOOD_CLOSE_M` are filled, limbs thinner than
+`WOOD_OPEN_M` are cut off, and specks of leaf-coloured noise go before either. What comes
+out is a shape with a workable interior: a dozen or so corners rather than a hundred, no
+pinched arms, no holes.
+
+The woods are traced early, because the lanes route around them and the parcels are cut
+against them, but they are **written out last**. Cutting the fields leaves crescents — a
+Voronoi cell that loses most of itself to a wood comes back under `MIN_FIELD_HA` or
+thinner than `MIN_FIELD_WIDTH_M`, gets dropped, and what is left is bare ground in the
+shape of the wood it lies against. Those scraps go back to the wood, which is what the
+photograph had growing there before the parcels were laid over it. Only the wide ones:
+the gap mask is opened at `WOOD_POCKET_M` first, or the hedgerow web between the fields
+is one connected component and a single wood swallows the lot.
+
+Together that takes the ground belonging to nobody from ~9.7% of the map to ~6.5%, and
+the part of it wide enough to matter that lies against a wood from ~175 ha to ~9 ha.
 
 Only the **central village** is modelled as a settlement — one `landuse=farmyard`
 covering all of its blocks, with streets on top. Every other settlement in the reference
@@ -145,7 +164,9 @@ Most of what shapes the map is a named constant:
   image's field pattern survives as landform), the `VALLEY_*` profile, `PAD_SKIRT_M`.
 - `osm_generator/generate_osm.py` — `SPACING_OPEN_M` / `SPACING_DENSE_M` /
   `SPACING_SCALE` and `MAX_FIELDS` (field sizes and count), `HEDGE_M`,
-  `LANE_COVERAGE_M`, the river and wood crossing penalties, `SEED`, and the
+  `LANE_COVERAGE_M`, the river and wood crossing penalties, `SEED`, the
+  `WOOD_CLOSE_M` / `WOOD_OPEN_M` / `WOOD_POCKET_M` / `WOOD_SIMPLIFY_M` block that
+  decides how blocky the woods come out and how much stray ground they take, and the
   `GATE_MERGE_M` / `STREET_MIN_GAP_M` / `BACK_LANE_OFF_M` / `STREET_INSET_M` /
   `CROSS_SPACING_M` block that shapes the village.
 

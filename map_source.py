@@ -204,6 +204,46 @@ def open_holes(comp):
     return np.array(img) > 0
 
 
+def regularise(mask, close_m, open_m, speck_ha=0.0, s=GRID_S, fill=True):
+    """Compact a ragged raster blob: drop the specks, fill the notches, cut the arms.
+
+    A closing of radius `close_m` fills every concavity narrower than that; an opening
+    of radius `open_m` then removes every limb thinner than it. Together they turn an
+    outline traced off a photograph into a shape with a workable interior, which is
+    what a block of ground wants to be when something will be laid out inside it.
+
+    Specks go before the closing, not after: leaf-coloured noise scattered over a field
+    is not woodland, and closing first would rope it into whatever blob is nearest.
+
+    The structuring elements here are tens of pixels across, where binary_closing is
+    quadratic in the radius, so both passes go through a distance transform instead -
+    dilation is "within r of the mask", erosion is "further than r from the outside".
+    """
+    if speck_ha > 0.0:
+        lab, k = ndimage.label(mask, np.ones((3, 3), bool))
+        if k:
+            sizes = ndimage.sum(mask, lab, range(1, k + 1)) * s * s / 10000.0
+            keep = np.zeros(k + 1, bool)
+            keep[1:] = sizes >= speck_ha
+            mask = keep[lab]
+
+    def dilate(m, r):
+        return ndimage.distance_transform_edt(~m, sampling=s) <= r
+
+    def erode(m, r):
+        return ndimage.distance_transform_edt(m, sampling=s) > r
+
+    if not mask.any():
+        return mask
+    if close_m > 0.0:
+        mask = erode(dilate(mask, close_m), close_m)
+    if open_m > 0.0:
+        mask = dilate(erode(mask, open_m), open_m)
+    # `fill` is off when the mask is the *negative* space - the gaps between the
+    # parcels - where filling holes would swallow every parcel on the map.
+    return ndimage.binary_fill_holes(mask) if fill else mask
+
+
 def trace_components(mask, s, min_ha, simp_tol, offset=(0.0, 0.0), clip_to=None):
     """Outline every component of a boolean mask as simplified closed rings.
 
